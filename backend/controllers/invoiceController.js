@@ -1,0 +1,261 @@
+const Invoice = require('../models/Invoice');
+const Order = require('../models/Order');
+
+// @desc    Get all invoices
+// @route   GET /api/invoices
+// @access  Private
+exports.getAllInvoices = async (req, res) => {
+  try {
+    const query = {};
+
+    if (req.user.role === 'customer') {
+      query.customer = req.user.id;
+    }
+
+    if (req.user.role === 'vendor') {
+      query.vendor = req.user.id;
+    }
+
+    const invoices = await Invoice.find(query)
+      .populate('customer', 'name email companyName gstin')
+      .populate('vendor', 'name companyName gstin')
+      .populate('order')
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: invoices.length,
+      invoices
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching invoices'
+    });
+  }
+};
+
+// @desc    Get single invoice
+// @route   GET /api/invoices/:id
+// @access  Private
+exports.getInvoice = async (req, res) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id)
+      .populate('customer', 'name email companyName gstin phone address')
+      .populate('vendor', 'name companyName gstin phone address')
+      .populate('order')
+      .populate('items.product', 'name');
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invoice not found'
+      });
+    }
+
+    // Check access
+    if (
+      req.user.role === 'customer' && 
+      invoice.customer._id.toString() !== req.user.id
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+
+    if (
+      req.user.role === 'vendor' && 
+      invoice.vendor._id.toString() !== req.user.id
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      invoice
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching invoice'
+    });
+  }
+};
+
+// @desc    Create invoice from order
+// @route   POST /api/invoices
+// @access  Private (Vendor/Admin)
+exports.createInvoice = async (req, res) => {
+  try {
+    const { orderId, dueDate, notes } = req.body;
+
+    const order = await Order.findById(orderId)
+      .populate('items.product', 'name');
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    // Check if vendor
+    if (req.user.role === 'vendor' && order.vendor.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+
+    // Check if invoice already exists
+    const existingInvoice = await Invoice.findOne({ order: orderId });
+    if (existingInvoice) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invoice already exists for this order'
+      });
+    }
+
+    // Prepare invoice items
+    const invoiceItems = order.items.map(item => ({
+      product: item.product._id,
+      productName: item.product.name,
+      quantity: item.quantity,
+      pricePerUnit: item.pricePerUnit,
+      totalPrice: item.totalPrice,
+      rentalPeriod: `${new Date(item.rentalStartDate).toLocaleDateString()} - ${new Date(item.rentalEndDate).toLocaleDateString()}`
+    }));
+
+    const invoice = await Invoice.create({
+      order: orderId,
+      customer: order.customer,
+      vendor: order.vendor,
+      items: invoiceItems,
+      subtotal: order.subtotal,
+      taxAmount: order.taxAmount,
+      totalAmount: order.totalAmount,
+      securityDeposit: order.securityDeposit || 0,
+      lateReturnFee: order.lateReturnFee || 0,
+      balanceAmount: order.totalAmount,
+      dueDate: dueDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      notes,
+      status: 'draft'
+    });
+
+    await invoice.populate('customer', 'name email companyName gstin');
+    await invoice.populate('vendor', 'name companyName gstin');
+
+    res.status(201).json({
+      success: true,
+      message: 'Invoice created successfully',
+      invoice
+    });
+  } catch (error) {
+    console.error('Create invoice error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating invoice',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Add payment to invoice
+// @route   POST /api/invoices/:id/payment
+// @access  Private
+exports.addPayment = async (req, res) => {
+  try {
+    const { amount, method, transactionId, notes } = req.body;
+    const invoice = await Invoice.findById(req.params.id);
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invoice not found'
+      });
+    }
+
+    // Add payment record
+    invoice.payments.push({
+      amount,
+      method,
+      transactionId,
+      notes,
+      date: new Date()
+    });
+
+    // Update paid amount
+    invoice.paidAmount += amount;
+    invoice.balanceAmount = invoice.totalAmount - invoice.paidAmount;
+
+    // Update status
+    if (invoice.balanceAmount <= 0) {
+      invoice.status = 'paid';
+      invoice.balanceAmount = 0;
+    } else if (invoice.paidAmount > 0) {
+      invoice.status = 'partial';
+    }
+
+    invoice.updatedAt = Date.now();
+    await invoice.save();
+
+    // Update order payment status
+    await Order.findByIdAndUpdate(invoice.order, {
+      paymentStatus: invoice.status === 'paid' ? 'paid' : 'partial'
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Payment recorded successfully',
+      invoice
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error recording payment'
+    });
+  }
+};
+
+// @desc    Update invoice status
+// @route   PUT /api/invoices/:id/status
+// @access  Private (Vendor/Admin)
+exports.updateInvoiceStatus = async (req, res) => {
+  try {
+    const { status } = req.body;
+    const invoice = await Invoice.findById(req.params.id);
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invoice not found'
+      });
+    }
+
+    if (req.user.role === 'vendor' && invoice.vendor.toString() !== req.user.id) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized'
+      });
+    }
+
+    invoice.status = status;
+    invoice.updatedAt = Date.now();
+    await invoice.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Invoice status updated successfully',
+      invoice
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error updating invoice status'
+    });
+  }
+};
